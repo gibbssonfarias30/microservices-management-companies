@@ -7,6 +7,8 @@ import com.backfcdev.reportms.models.Company;
 import com.backfcdev.reportms.models.WebSite;
 import com.backfcdev.reportms.repository.CompaniesFallbackRepository;
 import com.backfcdev.reportms.streams.ReportPublisher;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cloud.circuitbreaker.resilience4j.Resilience4JCircuitBreakerFactory;
@@ -28,6 +30,7 @@ public class ReportServiceImpl implements ReportService {
     private final CompaniesFallbackRepository companiesFallbackRepository;
     private final Resilience4JCircuitBreakerFactory resilience4JCircuitBreakerFactory;
     private final ReportPublisher reportPublisher;
+    private final ObjectMapper objectMapper;
 
 
     @Override
@@ -43,6 +46,7 @@ public class ReportServiceImpl implements ReportService {
     public String saveReport(String report) {
         var format = DateTimeFormatter.ofPattern("dd/MM/yyyy");
         var placeholders = this.reportHelper.getPlaceholdersFromTemplate(report);
+        var circuitBreaker = this.resilience4JCircuitBreakerFactory.create("companies-circuit-breaker-event");
         var webSites = Stream.of(placeholders.get(3))
                 .map(website -> WebSite.builder().name(website).build())
                 .toList();
@@ -55,7 +59,12 @@ public class ReportServiceImpl implements ReportService {
                 .build();
 
         this.reportPublisher.publishReport(report);
-        this.companiesFeignClient.postByName(company);
+
+        circuitBreaker.run(
+                () -> this.companiesFeignClient.postByName(company),
+                throwable -> this.reportPublisher.publishCbReport(this.buildEventMsg(company))
+        );
+        //this.companiesFeignClient.postByName(company);
         return "Saved";
     }
 
@@ -73,5 +82,13 @@ public class ReportServiceImpl implements ReportService {
         log.warn(throwable.getMessage());
         return reportHelper.readTemplate(this.companiesFallbackRepository.getByName(name));
 
+    }
+
+    private String buildEventMsg(Company company) {
+        try {
+            return this.objectMapper.writeValueAsString(company);
+        } catch (JsonProcessingException e) {
+            throw new RuntimeException(e);
+        }
     }
 }
